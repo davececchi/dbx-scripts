@@ -214,8 +214,14 @@ batch_num = 0
 
 conn = get_connection()
 
+# Repartition so each Spark partition is small enough to fit in executor memory
+# when converted to Pandas. Target ~100K rows per partition.
+num_partitions = max(int(row_count / batch_size), df.rdd.getNumPartitions(), 1)
+df_repartitioned = df.repartition(num_partitions)
+print(f"Repartitioned into {num_partitions} partitions (~{row_count // num_partitions:,} rows each)\n")
+
 # Use toLocalIterator to avoid collecting the entire DataFrame into driver memory
-for pdf in df.toLocalIterator(prefetchPartitions=True):
+for pdf in df_repartitioned.toLocalIterator(prefetchPartitions=True):
     # toLocalIterator yields one Pandas DataFrame per Spark partition
     # We further chunk it into batch_size pieces for controlled COPY operations
     for chunk_start in range(0, len(pdf), batch_size):
