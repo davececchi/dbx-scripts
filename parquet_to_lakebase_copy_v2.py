@@ -1,14 +1,16 @@
 # Databricks notebook source
 # MAGIC %md
-# MAGIC # Parquet (UC Volume) → Lakebase (Postgres) via COPY (v2 — Executor-Side Load)
+# MAGIC # Parquet (UC Volume) → Lakebase (Postgres) via COPY (v2 — Serverless-Compatible)
 # MAGIC
 # MAGIC Reads an existing Parquet export from a UC Volume and loads it into Lakebase
 # MAGIC using the Postgres `COPY FROM STDIN` protocol. No intermediate CSV files —
 # MAGIC data is converted to CSV in-memory in batches.
 # MAGIC
-# MAGIC **v2 fix:** Each Spark executor opens its own connection to Lakebase and
-# MAGIC streams its partition directly via `foreachPartition`. The driver never
-# MAGIC touches row data, eliminating driver OOM on large datasets.
+# MAGIC **v2 fix:** Streams individual rows to the driver via `toLocalIterator` and
+# MAGIC buffers them into fixed-size COPY batches. Driver memory is bounded to
+# MAGIC ~1 partition + 1 CSV buffer at a time, preventing OOM on large datasets.
+# MAGIC Compatible with Databricks Serverless (no RDD API, no SparkContext, no
+# MAGIC executor-side network access required).
 # MAGIC
 # MAGIC **Prerequisites:**
 # MAGIC - Databricks Runtime 13.3 LTS+
@@ -78,28 +80,17 @@ df.printSchema()
 # COMMAND ----------
 
 # MAGIC %md
-# MAGIC ## Step 1b: Repartition for parallel loading
+# MAGIC ## Step 1b: Repartition to bound driver memory
 # MAGIC
-# MAGIC Each partition gets its own executor-side Postgres connection, so partition
-# MAGIC count controls load parallelism. Target ~`batch_size` rows per partition to
-# MAGIC keep executor memory reasonable while maximizing throughput.
+# MAGIC `toLocalIterator` materializes one partition at a time on the driver.
+# MAGIC Repartition so each partition holds ≈ `batch_size` rows, keeping driver
+# MAGIC memory predictable. Uses only DataFrame API (no RDD) for Serverless compat.
 
 # COMMAND ----------
 
 num_partitions = max(int(row_count / batch_size), 1)
-current_partitions = df.rdd.getNumPartitions()
-
-print(f"Current partitions: {current_partitions}")
-print(f"Target partitions:  {num_partitions}")
-
-if num_partitions > current_partitions:
-    df = df.repartition(num_partitions)
-    print(f"Repartitioned to {num_partitions} partitions.")
-elif num_partitions < current_partitions:
-    df = df.coalesce(num_partitions)
-    print(f"Coalesced to {num_partitions} partitions.")
-else:
-    print("Partition count already optimal — no change needed.")
+df = df.repartition(num_partitions)
+print(f"Repartitioned to {num_partitions} partitions (~{batch_size:,} rows each)")
 
 # COMMAND ----------
 
@@ -212,11 +203,12 @@ conn.close()
 # COMMAND ----------
 
 # MAGIC %md
-# MAGIC ## Step 3: Load via foreachPartition (executor-side COPY)
+# MAGIC ## Step 3: Stream rows to Lakebase via COPY FROM STDIN
 # MAGIC
-# MAGIC Each Spark executor opens its own Postgres connection and streams its
-# MAGIC partition directly into Lakebase via `COPY FROM STDIN`. The driver never
-# MAGIC touches row data — only the executors hold rows in memory.
+# MAGIC Uses `toLocalIterator(prefetchPartitions=False)` to stream individual rows
+# MAGIC to the driver one partition at a time. Rows are buffered into fixed-size
+# MAGIC batches and sent via `COPY FROM STDIN`. Driver memory stays bounded to
+# MAGIC ~1 partition (iterator internals) + 1 CSV buffer.
 
 # COMMAND ----------
 
@@ -228,7 +220,7 @@ copy_sql = f"""COPY "{target_table}" ({columns_csv})
 FROM STDIN
 WITH (FORMAT csv, HEADER false, DELIMITER ',', NULL '', QUOTE '"', ESCAPE '"');"""
 
-# Identify complex column indices for JSON serialization on executors
+# Identify complex column indices for JSON serialization
 complex_col_indices = set(
     i for i, field in enumerate(df.schema.fields)
     if field.dataType.simpleString().startswith(("array", "map", "struct"))
@@ -241,85 +233,85 @@ complex_col_names = [
 print(f"COPY command:\n{copy_sql}\n")
 if complex_col_names:
     print(f"Complex columns (→ JSONB): {complex_col_names}\n")
-print(f"Loading via foreachPartition (batch_size={batch_size:,} per COPY)...\n")
-
-# Accumulator to track total rows loaded across all executors
-rows_loaded_acc = spark.sparkContext.accumulator(0)
-
-# Capture connection params for executor closures (simple types serialize automatically)
-_host = lakebase_host
-_port = lakebase_port
-_db = lakebase_database
-_pw = lakebase_password
-_bs = batch_size
-_csql = copy_sql
-_complex = complex_col_indices
-
-
-def _copy_partition(rows_iter):
-    """Runs on each executor: streams partition rows to Lakebase via COPY."""
-    import psycopg2
-    import io
-    import csv
-    import json as _json
-
-    conn = None
-    try:
-        conn = psycopg2.connect(
-            host=_host,
-            port=int(_port),
-            dbname=_db,
-            user="databricks",
-            password=_pw,
-            sslmode="require",
-        )
-
-        buf = io.StringIO()
-        writer = csv.writer(buf, quoting=csv.QUOTE_MINIMAL)
-        count = 0
-        partition_total = 0
-
-        for row in rows_iter:
-            vals = []
-            for i, val in enumerate(row):
-                if val is None:
-                    vals.append("")
-                elif i in _complex:
-                    vals.append(_json.dumps(val))
-                else:
-                    vals.append(val)
-            writer.writerow(vals)
-            count += 1
-
-            if count >= _bs:
-                buf.seek(0)
-                with conn.cursor() as cur:
-                    cur.copy_expert(_csql, buf)
-                conn.commit()
-                partition_total += count
-                count = 0
-                buf = io.StringIO()
-                writer = csv.writer(buf, quoting=csv.QUOTE_MINIMAL)
-
-        # Flush remaining rows
-        if count > 0:
-            buf.seek(0)
-            with conn.cursor() as cur:
-                cur.copy_expert(_csql, buf)
-            conn.commit()
-            partition_total += count
-
-        rows_loaded_acc.add(partition_total)
-    finally:
-        if conn:
-            conn.close()
-
+print(f"Streaming in batches of {batch_size:,} rows...\n")
 
 load_start = time.time()
-df.foreachPartition(_copy_partition)
-load_elapsed = time.time() - load_start
+total_rows_loaded = 0
+batch_num = 0
 
-total_rows_loaded = rows_loaded_acc.value
+conn = get_connection()
+
+buf = io.StringIO()
+writer = csv.writer(buf, quoting=csv.QUOTE_MINIMAL)
+count = 0
+
+# prefetchPartitions=False → only one partition in driver memory at a time
+for row in df.toLocalIterator(prefetchPartitions=False):
+    vals = []
+    for i, val in enumerate(row):
+        if val is None:
+            vals.append("")
+        elif i in complex_col_indices:
+            vals.append(json.dumps(val))
+        else:
+            vals.append(val)
+    writer.writerow(vals)
+    count += 1
+
+    if count >= batch_size:
+        batch_num += 1
+        buf.seek(0)
+        try:
+            with conn.cursor() as cur:
+                cur.copy_expert(copy_sql, buf)
+            conn.commit()
+            total_rows_loaded += count
+            elapsed = time.time() - load_start
+            pct = total_rows_loaded / row_count * 100 if row_count > 0 else 0
+            print(
+                f"  Batch {batch_num}: {count:,} rows — "
+                f"{total_rows_loaded:,} total ({pct:.1f}%) — "
+                f"{elapsed:.1f}s elapsed"
+            )
+        except Exception as e:
+            print(f"  Batch {batch_num}: FAILED — {e}")
+            try:
+                conn.rollback()
+            except Exception:
+                pass
+            try:
+                conn.close()
+            except Exception:
+                pass
+            conn = get_connection()
+        count = 0
+        buf = io.StringIO()
+        writer = csv.writer(buf, quoting=csv.QUOTE_MINIMAL)
+
+# Flush remaining rows
+if count > 0:
+    batch_num += 1
+    buf.seek(0)
+    try:
+        with conn.cursor() as cur:
+            cur.copy_expert(copy_sql, buf)
+        conn.commit()
+        total_rows_loaded += count
+        elapsed = time.time() - load_start
+        pct = total_rows_loaded / row_count * 100 if row_count > 0 else 0
+        print(
+            f"  Batch {batch_num}: {count:,} rows — "
+            f"{total_rows_loaded:,} total ({pct:.1f}%) — "
+            f"{elapsed:.1f}s elapsed"
+        )
+    except Exception as e:
+        print(f"  Batch {batch_num}: FAILED — {e}")
+        try:
+            conn.rollback()
+        except Exception:
+            pass
+
+load_elapsed = time.time() - load_start
 
 print(f"\nLoad complete in {load_elapsed:.1f}s")
 print(f"  Rows streamed: {total_rows_loaded:,}")
