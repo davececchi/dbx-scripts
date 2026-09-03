@@ -67,7 +67,13 @@ HOST="$(clean "${DATABRICKS_HOST:-}")"
 SPACE="$(clean "${GENIE_SPACE_ID:-}")"
 CLIENT_ID="$(clean "${CLIENT_ID:-}")"
 CLIENT_SECRET="$(clean "${CLIENT_SECRET:-}")"
+# Set a tenant id to authenticate the NATIVE Entra way (Entra secret -> Entra
+# token endpoint -> AAD token, accepted first-party by Azure Databricks).
+# Accepts TENANT_ID or AZURE_TENANT_ID / ARM_TENANT_ID.
+TENANT="$(clean "${TENANT_ID:-${AZURE_TENANT_ID:-${ARM_TENANT_ID:-}}}")"
 TOKEN="$(clean "${DATABRICKS_TOKEN:-}")"
+# Azure Databricks first-party resource/app id (constant) for the Entra scope.
+ADB_RESOURCE="2ff814a6-3304-4ab8-85cb-cd0e6f879c1d"
 QUESTION="${GENIE_QUESTION:-What data is available in this space?}"
 
 # ---- pretty output ----------------------------------------------------------
@@ -92,21 +98,61 @@ hdr "Config"
 [ -n "$SPACE" ] || die "GENIE_SPACE_ID is not set"
 info "host        : $HOST"
 info "genie space : $SPACE"
+# Decide the auth mode: supplied token > native Entra (tenant set) > Databricks OAuth.
 if [ -n "$TOKEN" ]; then
-  info "auth        : pre-supplied DATABRICKS_TOKEN (skipping OAuth step 1)"
+  AUTH_MODE="token"
+elif [ -n "$TENANT" ]; then
+  AUTH_MODE="entra"
 else
-  [ -n "$CLIENT_ID" ]     || die "CLIENT_ID is not set (and no DATABRICKS_TOKEN given)"
-  [ -n "$CLIENT_SECRET" ] || die "CLIENT_SECRET is not set (and no DATABRICKS_TOKEN given)"
-  info "auth        : OAuth M2M as client_id $CLIENT_ID"
+  AUTH_MODE="dbx"
+fi
+if [ "$AUTH_MODE" = "token" ]; then
+  info "auth        : pre-supplied DATABRICKS_TOKEN (skipping token step)"
+elif [ "$AUTH_MODE" = "entra" ]; then
+  [ -n "$CLIENT_ID" ]     || die "CLIENT_ID (Entra app id) is not set"
+  [ -n "$CLIENT_SECRET" ] || die "CLIENT_SECRET (Entra secret) is not set"
+  info "auth        : NATIVE Entra SP (tenant $TENANT, client_id $CLIENT_ID)"
+else
+  [ -n "$CLIENT_ID" ]     || die "CLIENT_ID is not set (and no DATABRICKS_TOKEN/TENANT_ID given)"
+  [ -n "$CLIENT_SECRET" ] || die "CLIENT_SECRET is not set (and no DATABRICKS_TOKEN/TENANT_ID given)"
+  info "auth        : Databricks OAuth M2M as client_id $CLIENT_ID"
 fi
 
 # =============================================================================
 # STEP 1 - Token (authentication)
 # =============================================================================
-hdr "Step 1 - OAuth token   POST /oidc/v1/token"
-if [ -n "$TOKEN" ]; then
-  pass "using supplied DATABRICKS_TOKEN (OAuth step skipped)"
+if [ "$AUTH_MODE" = "token" ]; then
+  hdr "Step 1 - Token         (using supplied DATABRICKS_TOKEN)"
+  pass "OAuth step skipped - testing the supplied bearer token"
+elif [ "$AUTH_MODE" = "entra" ]; then
+  # NATIVE Entra path: Entra secret -> Entra token endpoint -> AAD token for the
+  # Azure Databricks resource. Azure Databricks accepts this first-party as long
+  # as the SP is assigned to the workspace. This is what an Entra-native app does.
+  hdr "Step 1 - Entra token   POST login.microsoftonline.com/$TENANT/oauth2/v2.0/token"
+  RESP=$(curl -sS -w $'\n%{http_code}' -X POST \
+           "https://login.microsoftonline.com/$TENANT/oauth2/v2.0/token" \
+           -d "grant_type=client_credentials" \
+           --data-urlencode "client_id=$CLIENT_ID" \
+           --data-urlencode "client_secret=$CLIENT_SECRET" \
+           --data-urlencode "scope=$ADB_RESOURCE/.default")
+  CODE=$(printf '%s' "$RESP" | tail -n1)
+  BODY=$(printf '%s' "$RESP" | sed '$d')
+  if [ "$CODE" = "200" ]; then
+    TOKEN=$(printf '%s' "$BODY" | json_str access_token)
+    [ -n "$TOKEN" ] || die "Entra returned 200 but no access_token found"
+    pass "HTTP 200 - got Entra (AAD) token for Azure Databricks (length ${#TOKEN})"
+  else
+    fail "HTTP $CODE"
+    info "$(printf '%s' "$BODY" | head -c 400)"
+    echo
+    info "${YEL}Diagnosis: Entra itself rejected the SP credentials (before Databricks).${RST}"
+    info "  AADSTS7000215 invalid client secret - wrong/expired Entra secret."
+    info "  AADSTS700016 app not found in tenant - wrong CLIENT_ID or wrong TENANT_ID."
+    info "  AADSTS70011 invalid scope - the resource id should be $ADB_RESOURCE/.default"
+    die "could not get an Entra token"
+  fi
 else
+  hdr "Step 1 - OAuth token   POST /oidc/v1/token  (Databricks-issued)"
   RESP=$(curl -sS -w $'\n%{http_code}' -X POST "$HOST/oidc/v1/token" \
            -u "$CLIENT_ID:$CLIENT_SECRET" \
            -d "grant_type=client_credentials&scope=all-apis")
@@ -133,9 +179,20 @@ else
     info "$(printf '%s' "$BODY" | head -c 400)"
     echo
     info "${YEL}Diagnosis:${RST} authentication failed BEFORE any Genie call. Common causes:"
-    info "  401/unauthorized_client - wrong CLIENT_ID/CLIENT_SECRET, or secret expired/deleted."
-    info "  404 / wrong host        - DATABRICKS_HOST wrong, or SP not added to THIS workspace."
-    info "  On Azure: confirm the SP has a Databricks-managed OAuth secret (not just an Entra secret)."
+    if printf '%s' "$BODY" | grep -qi "invalid_client\|Client authentication failed"; then
+      info "  ${BLD}invalid_client${RST} = the Databricks token endpoint rejected this credential."
+      info "  You gave an Entra SP secret to the DATABRICKS issuer - wrong issuer for that secret."
+      info "  ${BLD}Fix A (native Entra, recommended for your case):${RST} set TENANT_ID in .env and re-run."
+      info "     The script then authenticates the SP through Entra (its native issuer) and uses the"
+      info "     resulting first-party token against Databricks. Keep your Entra CLIENT_ID/SECRET."
+      info "  ${BLD}Fix B (Databricks-issued):${RST} mint a Databricks-managed OAuth secret for the SP"
+      info "     (Settings > Identity and access > Service principals > <sp> > Secrets > Generate),"
+      info "     and use THAT as CLIENT_SECRET with no TENANT_ID."
+      info "  Either way: the SP must be assigned to THIS workspace, and the secret not expired."
+    else
+      info "  401/unauthorized_client - wrong CLIENT_ID/CLIENT_SECRET, or secret expired/deleted."
+      info "  404 / wrong host        - DATABRICKS_HOST wrong, or SP not added to THIS workspace."
+    fi
     die "cannot obtain a token"
   fi
 fi
