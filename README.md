@@ -1,2 +1,0 @@
-# dbx-scripts
-dbx-scripts
