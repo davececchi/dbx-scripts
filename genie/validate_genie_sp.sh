@@ -37,8 +37,17 @@
 #
 # REQUIREMENTS: bash + curl. (jq is used if present, but is NOT required.)
 
+# This script uses bash features (arrays, ${!var}, $'...'). If it was started
+# with `sh script.sh`, re-exec under bash so those work reliably.
+if [ -z "${BASH_VERSION:-}" ]; then exec bash "$0" "$@"; fi
+
 # Do not use `set -e`: we want to walk every layer and report, not bail early.
 set -u
+
+# Strip CR (from Windows/CRLF .env files), surrounding whitespace and quotes.
+# A trailing \r in DATABRICKS_HOST is THE classic cause of curl error (3)
+# "URL rejected: Malformed input to a URL function".
+clean() { printf '%s' "${1-}" | tr -d '\r\n' | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//' -e 's/^"//' -e 's/"$//' -e "s/^'//" -e "s/'$//"; }
 
 # ---- load .env if present ---------------------------------------------------
 # Values already in the environment WIN; .env only fills in what is unset,
@@ -53,12 +62,12 @@ if [ -f "$SCRIPT_DIR/.env" ]; then
   done < "$SCRIPT_DIR/.env"
 fi
 
-# ---- config (env vars) ------------------------------------------------------
-HOST="${DATABRICKS_HOST:-}"
-SPACE="${GENIE_SPACE_ID:-}"
-CLIENT_ID="${CLIENT_ID:-}"
-CLIENT_SECRET="${CLIENT_SECRET:-}"
-TOKEN="${DATABRICKS_TOKEN:-}"
+# ---- config (env vars) — clean() every value so a stray CR/space can't break curl
+HOST="$(clean "${DATABRICKS_HOST:-}")"
+SPACE="$(clean "${GENIE_SPACE_ID:-}")"
+CLIENT_ID="$(clean "${CLIENT_ID:-}")"
+CLIENT_SECRET="$(clean "${CLIENT_SECRET:-}")"
+TOKEN="$(clean "${DATABRICKS_TOKEN:-}")"
 QUESTION="${GENIE_QUESTION:-What data is available in this space?}"
 
 # ---- pretty output ----------------------------------------------------------
@@ -107,6 +116,18 @@ else
     TOKEN=$(printf '%s' "$BODY" | json_str access_token)
     if [ -z "$TOKEN" ]; then die "token endpoint returned 200 but no access_token found"; fi
     pass "HTTP 200 - got access token (length ${#TOKEN})"
+  elif [ "$CODE" = "000" ]; then
+    # curl never got an HTTP response at all (couldn't build/reach the URL).
+    fail "HTTP 000 - curl could not send the request"
+    info "$(printf '%s' "$BODY" | head -c 200)"
+    echo
+    info "${YEL}Diagnosis: this is NOT an auth problem - curl rejected the URL or couldn't connect.${RST}"
+    info "  host as seen by the script: [$HOST]   (should be https://...azuredatabricks.net, no trailing chars)"
+    info "  Most common: a hidden carriage return from a Windows/CRLF-saved .env"
+    info "    -> re-save .env with UNIX line endings, or run:  tr -d '\\r' < .env > .env.tmp && mv .env.tmp .env"
+    info "  Also check: DATABRICKS_HOST has https:// and no trailing slash/space; and that a"
+    info "    corporate proxy/VPN isn't blocking the workspace (try: curl -sSI $HOST)."
+    die "cannot reach the token endpoint"
   else
     fail "HTTP $CODE"
     info "$(printf '%s' "$BODY" | head -c 400)"
